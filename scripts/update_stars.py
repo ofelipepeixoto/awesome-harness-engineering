@@ -17,6 +17,10 @@ Environment:
 from __future__ import annotations
 
 import json
+import math
+import re
+import tempfile
+from urllib.parse import urlsplit
 import os
 import sys
 import time
@@ -143,33 +147,83 @@ TOC_ANCHORS = {
 
 
 # ── GitHub Search helpers ──────────────────────────────────────────────────────
+MAX_ATTEMPTS = 3
+MAX_WAIT = 10
+
+
+def canonical_url(value: str) -> str:
+    """Accept repository URLs only; no credentials, ports or URL query syntax."""
+    if not isinstance(value, str):
+        raise ValueError("repository URL must be text")
+    parsed = urlsplit(value)
+    if (parsed.scheme.lower() != "https" or parsed.netloc.lower() != "github.com"
+            or parsed.query or parsed.fragment):
+        raise ValueError("expected HTTPS GitHub repository URL")
+    parts = parsed.path.strip("/").split("/")
+    if len(parts) != 2 or any(not re.fullmatch(r"[A-Za-z0-9_.-]+", p) or p in (".", "..") for p in parts):
+        raise ValueError("expected owner/repository")
+    parts[1] = parts[1].removesuffix(".git")
+    if not parts[1] or parts[1] in (".", ".."):
+        raise ValueError("invalid repository")
+    return "https://github.com/" + "/".join(parts).lower()
+
+
+def deduplicate(repos: list[dict]) -> list[dict]:
+    result, seen = [], set()
+    for repo in repos:
+        key = canonical_url(repo["url"])
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append({**repo, "url": key, "name": key.removeprefix("https://github.com/")})
+    return result
+
+
+def bounded_get(url, **kwargs):
+    """At most three requests and two bounded sleeps; authorization 403 is final."""
+    for attempt in range(MAX_ATTEMPTS):
+        response = requests.get(url, headers=HEADERS, timeout=15,
+                                allow_redirects=False, **kwargs)
+        rate_limited = response.status_code == 403 and (
+            response.headers.get("X-RateLimit-Remaining") == "0"
+            or "Retry-After" in response.headers)
+        retryable = rate_limited or response.status_code in (429, 500, 502, 503, 504)
+        if not retryable or attempt == MAX_ATTEMPTS - 1:
+            return response
+        try:
+            raw = response.headers.get("Retry-After")
+            if raw is not None:
+                delay = float(raw)
+            elif rate_limited and "X-RateLimit-Reset" in response.headers:
+                delay = float(response.headers["X-RateLimit-Reset"]) - time.time()
+            else:
+                delay = 2 ** attempt
+        except (TypeError, ValueError):
+            delay = 2 ** attempt
+        # Do not retry early when the server asks us to wait beyond our budget.
+        if not math.isfinite(delay) or delay > MAX_WAIT:
+            return response
+        time.sleep(max(0, delay))
+    raise AssertionError("unreachable")
+
+
 def search_github(query: str) -> list[dict]:
-    """Search GitHub repositories matching *query*. Returns raw API items."""
-    url = "https://api.github.com/search/repositories"
-    params = {"q": query, "sort": "stars", "order": "desc", "per_page": 100}
-    try:
-        resp = requests.get(url, headers=HEADERS, params=params, timeout=20)
-        if resp.status_code == 200:
-            return resp.json().get("items", [])
-        if resp.status_code == 403:
-            reset = int(resp.headers.get("X-RateLimit-Reset", time.time() + 60))
-            wait  = max(reset - int(time.time()), 0) + 5
-            print(f"  [403] Rate-limited. Waiting {wait}s …")
-            time.sleep(wait)
-            resp2 = requests.get(url, headers=HEADERS, params=params, timeout=20)
-            if resp2.status_code == 200:
-                return resp2.json().get("items", [])
-        print(f"  [Search {resp.status_code}] {query!r}")
-    except requests.RequestException as exc:
-        print(f"  [Search ERR] {query!r}: {exc}")
-    return []
+    """Failures abort the update instead of publishing a partial success."""
+    response = bounded_get("https://api.github.com/search/repositories",
+                           params={"q": query, "sort": "stars", "order": "desc", "per_page": 100})
+    if response.status_code != 200:
+        raise RuntimeError(f"GitHub search failed: HTTP {response.status_code}")
+    payload = response.json()
+    if not isinstance(payload, dict) or not isinstance(payload.get("items"), list) or payload.get("incomplete_results"):
+        raise ValueError("invalid or incomplete search result")
+    return payload["items"]
 
 
 def normalize_repo(gh_item: dict, category: str) -> dict:
     """Convert a GitHub Search API result item to the internal schema."""
     return {
-        "name":        gh_item["full_name"],
-        "url":         gh_item["html_url"],
+        "name":        canonical_url(gh_item["html_url"]).removeprefix("https://github.com/"),
+        "url":         canonical_url(gh_item["html_url"]),
         "description": gh_item.get("description") or "",
         "stars":       gh_item["stargazers_count"],
         "forks":       gh_item.get("forks_count", 0),
@@ -185,13 +239,14 @@ def discover_repos(existing_urls: set[str]) -> list[dict]:
     Run all SEARCH_QUERIES; return newly-discovered repos not in
     *existing_urls* and with stars > MIN_STARS.
     """
+    existing_urls = {canonical_url(url) for url in existing_urls}
     new_repos: list[dict] = []
     for category, queries in SEARCH_QUERIES.items():
         for query in queries:
             print(f"  Searching: {query!r}")
             items = search_github(query)
             for item in items:
-                html_url = item.get("html_url", "")
+                html_url = canonical_url(item.get("html_url", ""))
                 if html_url in existing_urls:
                     continue
                 if item.get("stargazers_count", 0) <= MIN_STARS:
@@ -205,25 +260,33 @@ def discover_repos(existing_urls: set[str]) -> list[dict]:
 
 # ── Star fetching ──────────────────────────────────────────────────────────────
 def fetch_stars(full_name: str) -> int | None:
-    """Return current star count for <owner>/<repo>, or None on error."""
-    url = GITHUB_API.format(full_name)
+    """Return stars or None; main refuses publication if any refresh failed."""
+    name = canonical_url("https://github.com/" + full_name).removeprefix("https://github.com/")
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        if resp.status_code == 200:
-            return resp.json().get("stargazers_count")
-        if resp.status_code == 404:
-            print(f"  [404] {full_name} — not found (archived/deleted?)")
-        elif resp.status_code == 403:
-            reset = int(resp.headers.get("X-RateLimit-Reset", 0))
-            wait  = max(reset - int(time.time()), 1)
-            print(f"  [403] Rate limited. Waiting {wait}s …")
-            time.sleep(wait + 1)
-            return fetch_stars(full_name)   # retry once
-        else:
-            print(f"  [{resp.status_code}] {full_name}")
-    except requests.RequestException as exc:
-        print(f"  [ERR] {full_name}: {exc}")
+        response = bounded_get(GITHUB_API.format(name))
+        if response.status_code == 200:
+            stars = response.json().get("stargazers_count")
+            if type(stars) is int and stars >= 0:
+                return stars
+    except (requests.RequestException, ValueError, AttributeError):
+        pass
     return None
+
+
+def atomic_write(path: Path, content: str) -> None:
+    """Replace one file atomically in its own directory; not a two-file transaction."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",
+                                         dir=path.parent, prefix=".catalog-", delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 # ── README generation ──────────────────────────────────────────────────────────
@@ -389,7 +452,7 @@ def generate_readme(repos_by_cat: dict[str, list[dict]], today: str) -> str:
 def main() -> None:
     print(f"[{datetime.now(timezone.utc).isoformat()}] Loading {DATA_FILE}")
     with DATA_FILE.open() as f:
-        repos: list[dict] = json.load(f)
+        repos: list[dict] = deduplicate(json.load(f))
 
     total = len(repos)
     print(f"  {total} repos to refresh")
@@ -410,6 +473,9 @@ def main() -> None:
 
     print(f"\nRefresh done: {updated} updated, {skipped} unchanged, {errors} errors")
 
+    if errors:
+        raise RuntimeError("refresh incomplete; no output files changed")
+
     # Drop repos below threshold
     before = len(repos)
     repos = [r for r in repos if r.get("stars", 0) > MIN_STARS]
@@ -422,12 +488,6 @@ def main() -> None:
     repos.extend(new_repos)
     print(f"Total repos after discovery: {len(repos)}")
 
-    # Save data
-    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with DATA_FILE.open("w") as f:
-        json.dump(repos, f, indent=2, ensure_ascii=False)
-    print(f"Saved {DATA_FILE}")
-
     # Group by category and sort
     repos_by_cat: dict[str, list[dict]] = {cat: [] for cat in CATEGORY_ORDER}
     for repo in repos:
@@ -439,7 +499,10 @@ def main() -> None:
 
     today = date.today().isoformat()
     readme = generate_readme(repos_by_cat, today)
-    README_FILE.write_text(readme, encoding="utf-8")
+    # Serialize both before replacing either; each replacement is atomic.
+    serialized = json.dumps(repos, indent=2, ensure_ascii=False) + "\n"
+    atomic_write(DATA_FILE, serialized)
+    atomic_write(README_FILE, readme)
     print(f"Saved {README_FILE}")
 
 
